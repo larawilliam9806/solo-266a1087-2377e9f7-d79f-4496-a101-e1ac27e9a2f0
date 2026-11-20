@@ -22,6 +22,7 @@ import os
 import uuid
 
 from . import convert, db, domain
+from .cleanup import InFlightRegistry
 from .errors import AppError, Conflict, NotFound, Unprocessable, Unavailable
 from .storage import BlobStore
 
@@ -108,9 +109,12 @@ def _preview_public_payload(preview):
 
 
 class Service:
-    def __init__(self, conn_factory, store: BlobStore):
+    def __init__(self, conn_factory, store: BlobStore, registry=None):
         self.conn_factory = conn_factory
         self.store = store
+        # Digests this process is writing/using right now; shared with the
+        # blob cleaner so it never reclaims a file mid-operation.
+        self.registry = registry if registry is not None else InFlightRegistry()
 
     # ------------------------------------------------------------------
     # preview
@@ -150,49 +154,60 @@ class Service:
                 if outcome["status"] != "ok":
                     convertible = False
             original_name = _safe_name(filename)
-            original_sha = self.store.put_bytes(raw_bytes)
+            original_sha = hashlib.sha256(raw_bytes).hexdigest()
+            in_flight = [original_sha]
             for name in domain.DOWNSTREAM_ORDER:
                 outcome = results[name]
                 outcome["output_size"] = len(outcome["output_bytes"])
                 if outcome["output_bytes"]:
-                    self.store.put_bytes(outcome["output_bytes"])
-                outcome.pop("output_bytes", None)
+                    in_flight.append(hashlib.sha256(outcome["output_bytes"]).hexdigest())
 
-            snapshot = {
-                "original": {
-                    "name": original_name,
-                    "size": len(raw_bytes),
-                    "sha256": original_sha,
-                    "row_count": parsed.row_count,
-                    "header": parsed.header,
-                },
-                "contracts": {
-                    name: {
-                        "version": contracts[name]["version"],
-                        "fingerprint": contracts[name]["fingerprint"],
-                        "columns": contracts[name]["columns"],
-                    }
-                    for name in domain.DOWNSTREAM_ORDER
-                },
-                "downstreams": results,
-                "convertible": convertible,
-            }
-            preview_id = uuid.uuid4().hex
-            with db.transaction(conn):
-                db.create_preview(
-                    conn,
-                    preview_id=preview_id,
-                    day=day,
-                    base_rev=base_rev,
-                    contract_versions={
-                        name: contracts[name]["version"] for name in domain.DOWNSTREAM_ORDER
+            # The blobs land on disk before the preview row exists; until the
+            # insert commits, the in-flight registry is the only thing that
+            # keeps the cleaner from reclaiming them.
+            with self.registry.guard(in_flight):
+                self.store.put_bytes(raw_bytes)
+                for name in domain.DOWNSTREAM_ORDER:
+                    outcome = results[name]
+                    if outcome["output_bytes"]:
+                        self.store.put_bytes(outcome["output_bytes"])
+                    outcome.pop("output_bytes", None)
+
+                snapshot = {
+                    "original": {
+                        "name": original_name,
+                        "size": len(raw_bytes),
+                        "sha256": original_sha,
+                        "row_count": parsed.row_count,
+                        "header": parsed.header,
                     },
-                    original_name=original_name,
-                    original_size=len(raw_bytes),
-                    original_sha256=original_sha,
-                    result=snapshot,
-                    convertible=convertible,
-                )
+                    "contracts": {
+                        name: {
+                            "version": contracts[name]["version"],
+                            "fingerprint": contracts[name]["fingerprint"],
+                            "columns": contracts[name]["columns"],
+                        }
+                        for name in domain.DOWNSTREAM_ORDER
+                    },
+                    "downstreams": results,
+                    "convertible": convertible,
+                }
+                preview_id = uuid.uuid4().hex
+                with db.transaction(conn):
+                    db.create_preview(
+                        conn,
+                        preview_id=preview_id,
+                        day=day,
+                        base_rev=base_rev,
+                        contract_versions={
+                            name: contracts[name]["version"] for name in domain.DOWNSTREAM_ORDER
+                        },
+                        original_name=original_name,
+                        original_size=len(raw_bytes),
+                        original_sha256=original_sha,
+                        result=snapshot,
+                        convertible=convertible,
+                    )
             preview = db.get_preview(conn, preview_id)
             return 201, _preview_public_payload(preview)
         finally:
@@ -226,127 +241,145 @@ class Service:
     def confirm(self, preview_id):
         conn = self.conn_factory()
         try:
-            with db.transaction(conn, immediate=True):
-                preview = db.get_preview(conn, preview_id)
-                if preview is None:
-                    raise NotFound("预览不存在或已失效，请重新上传并预览", code="preview_not_found")
-                if preview["consumed_at"]:
-                    raise Conflict("该预览已用于发布，不能重复确认", code="preview_used")
-                now = db.iso(db.utcnow())
-                if preview["expires_at"] < now:
-                    db.delete_preview(conn, preview_id)
-                    raise Conflict("预览已过期，请重新上传并预览", code="preview_expired")
-
-                result = preview["result"]
-                day = preview["day"]
-                current_rev = db.day_revision(conn, day)
-                if current_rev != preview["base_rev"]:
-                    raise Conflict(
-                        f"该日已发布到修订号 {current_rev}，预览基于修订号 "
-                        f"{preview['base_rev']}，请重新预览后再确认",
-                        code="stale_day_revision",
-                    )
-
-                contracts = db.get_contracts(conn)
-                for name in domain.DOWNSTREAM_ORDER:
-                    snapshot = result["contracts"][name]
-                    if contracts[name]["version"] != preview[name + "_version"] or (
-                        contracts[name]["fingerprint"] != snapshot["fingerprint"]
-                    ):
-                        raise Conflict(
-                            f"{domain.label_for(name)} 契约在预览后已变更，"
-                            "请重新预览后再确认",
-                            code="stale_contract",
-                        )
-
-                if not preview["convertible"] or not result.get("convertible"):
-                    raise Unprocessable(
-                        "存在不兼容的列或行，不能发布；请修正 CSV 或契约后重新预览",
-                        code="incompatible",
-                    )
-
-                # Re-materialise from the stored original bytes and the frozen
-                # contract snapshot, and verify it matches what was previewed.
-                original_bytes = self.store.read_bytes(preview["original_sha256"])
-                if hashlib.sha256(original_bytes).hexdigest() != preview["original_sha256"]:
-                    raise Unavailable("预览原件校验失败，请重新上传并预览")
-                try:
-                    parsed = convert.parse_csv_bytes(original_bytes)
-                except convert.CsvProblem:
-                    raise Unavailable(
-                        "预览原件无法再次解析，请重新上传并预览"
-                    ) from None
-
-                outputs = {}
-                for name in domain.DOWNSTREAM_ORDER:
-                    snapshot = result["contracts"][name]
-                    outcome = convert.convert(parsed, snapshot["columns"])
-                    if outcome["status"] != "ok":
-                        raise Conflict(
-                            "当前契约与预览结果不一致，请重新预览", code="stale_contract"
-                        )
-                    expected = result["downstreams"][name]["output_sha256"]
-                    actual = hashlib.sha256(outcome["output_bytes"]).hexdigest()
-                    if expected != actual:
-                        raise Unavailable("预览结果校验失败，请重新预览")
-                    outputs[name] = (actual, len(outcome["output_bytes"]), outcome["output_bytes"])
-                    if not self.store.exists(actual):
-                        self.store.put_bytes(outcome["output_bytes"])
-
-                # Blobs are durable; now commit the row + pointer atomically.
-                new_rev = current_rev + 1
-                created_at = db.iso(db.utcnow())
-                settlement_cols = json.dumps(result["contracts"]["settlement"]["columns"], ensure_ascii=False)
-                ridership_cols = json.dumps(result["contracts"]["ridership"]["columns"], ensure_ascii=False)
-                conn.execute(
-                    """INSERT INTO publications
-                       (day, rev, original_name, original_size, original_sha256,
-                        settlement_sha256, settlement_size, ridership_sha256, ridership_size,
-                        settlement_fingerprint, ridership_fingerprint,
-                        settlement_version, ridership_version,
-                        settlement_columns, ridership_columns, row_count, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        day,
-                        new_rev,
-                        preview["original_name"],
-                        preview["original_size"],
-                        preview["original_sha256"],
-                        outputs["settlement"][0],
-                        outputs["settlement"][1],
-                        outputs["ridership"][0],
-                        outputs["ridership"][1],
-                        result["contracts"]["settlement"]["fingerprint"],
-                        result["contracts"]["ridership"]["fingerprint"],
-                        result["contracts"]["settlement"]["version"],
-                        result["contracts"]["ridership"]["version"],
-                        settlement_cols,
-                        ridership_cols,
-                        parsed.row_count,
-                        created_at,
-                    ),
-                )
-                if current_rev == 0:
-                    conn.execute(
-                        "INSERT INTO days (day, current_rev, updated_at) VALUES (?, ?, ?)",
-                        (day, new_rev, created_at),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE days SET current_rev = ?, updated_at = ? WHERE day = ?",
-                        (new_rev, created_at, day),
-                    )
-                conn.execute(
-                    "UPDATE previews SET consumed_at = ? WHERE id = ?",
-                    (created_at, preview_id),
-                )
-                # The preview row is now consumed; publications are the only
-                # thing downloads resolve against, so the preview can go.
-                db.delete_preview(conn, preview_id)
-                row = db.get_publication(conn, day, new_rev)
+            # Read the preview once outside the write transaction to learn
+            # which blobs this confirm will rely on, and protect them from
+            # the cleaner until the publication row commits (the preview row
+            # alone no longer protects them once it expires mid-confirm).
+            pending = db.get_preview(conn, preview_id)
+            if pending is None:
+                raise NotFound("预览不存在或已失效，请重新上传并预览", code="preview_not_found")
+            in_flight = [pending["original_sha256"]]
+            downstreams = pending["result"].get("downstreams") or {}
+            for name in domain.DOWNSTREAM_ORDER:
+                digest = (downstreams.get(name) or {}).get("output_sha256")
+                if digest:
+                    in_flight.append(digest)
+            with self.registry.guard(in_flight):
+                with db.transaction(conn, immediate=True):
+                    row = self._confirm_in_transaction(conn, preview_id)
             return 201, _publication_payload(row)
         finally:
             conn.close()
+
+    def _confirm_in_transaction(self, conn, preview_id):
+        preview = db.get_preview(conn, preview_id)
+        if preview is None:
+            raise NotFound("预览不存在或已失效，请重新上传并预览", code="preview_not_found")
+        if preview["consumed_at"]:
+            raise Conflict("该预览已用于发布，不能重复确认", code="preview_used")
+        now = db.iso(db.utcnow())
+        if preview["expires_at"] < now:
+            db.delete_preview(conn, preview_id)
+            raise Conflict("预览已过期，请重新上传并预览", code="preview_expired")
+
+        result = preview["result"]
+        day = preview["day"]
+        current_rev = db.day_revision(conn, day)
+        if current_rev != preview["base_rev"]:
+            raise Conflict(
+                f"该日已发布到修订号 {current_rev}，预览基于修订号 "
+                f"{preview['base_rev']}，请重新预览后再确认",
+                code="stale_day_revision",
+            )
+
+        contracts = db.get_contracts(conn)
+        for name in domain.DOWNSTREAM_ORDER:
+            snapshot = result["contracts"][name]
+            if contracts[name]["version"] != preview[name + "_version"] or (
+                contracts[name]["fingerprint"] != snapshot["fingerprint"]
+            ):
+                raise Conflict(
+                    f"{domain.label_for(name)} 契约在预览后已变更，"
+                    "请重新预览后再确认",
+                    code="stale_contract",
+                )
+
+        if not preview["convertible"] or not result.get("convertible"):
+            raise Unprocessable(
+                "存在不兼容的列或行，不能发布；请修正 CSV 或契约后重新预览",
+                code="incompatible",
+            )
+
+        # Re-materialise from the stored original bytes and the frozen
+        # contract snapshot, and verify it matches what was previewed.
+        original_bytes = self.store.read_bytes(preview["original_sha256"])
+        if hashlib.sha256(original_bytes).hexdigest() != preview["original_sha256"]:
+            raise Unavailable("预览原件校验失败，请重新上传并预览")
+        try:
+            parsed = convert.parse_csv_bytes(original_bytes)
+        except convert.CsvProblem:
+            raise Unavailable(
+                "预览原件无法再次解析，请重新上传并预览"
+            ) from None
+
+        outputs = {}
+        for name in domain.DOWNSTREAM_ORDER:
+            snapshot = result["contracts"][name]
+            outcome = convert.convert(parsed, snapshot["columns"])
+            if outcome["status"] != "ok":
+                raise Conflict(
+                    "当前契约与预览结果不一致，请重新预览", code="stale_contract"
+                )
+            expected = result["downstreams"][name]["output_sha256"]
+            actual = hashlib.sha256(outcome["output_bytes"]).hexdigest()
+            if expected != actual:
+                raise Unavailable("预览结果校验失败，请重新预览")
+            outputs[name] = (actual, len(outcome["output_bytes"]), outcome["output_bytes"])
+            if not self.store.exists(actual):
+                self.store.put_bytes(outcome["output_bytes"])
+
+        # Blobs are durable; now commit the row + pointer atomically.
+        new_rev = current_rev + 1
+        created_at = db.iso(db.utcnow())
+        settlement_cols = json.dumps(result["contracts"]["settlement"]["columns"], ensure_ascii=False)
+        ridership_cols = json.dumps(result["contracts"]["ridership"]["columns"], ensure_ascii=False)
+        conn.execute(
+            """INSERT INTO publications
+               (day, rev, original_name, original_size, original_sha256,
+                settlement_sha256, settlement_size, ridership_sha256, ridership_size,
+                settlement_fingerprint, ridership_fingerprint,
+                settlement_version, ridership_version,
+                settlement_columns, ridership_columns, row_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                day,
+                new_rev,
+                preview["original_name"],
+                preview["original_size"],
+                preview["original_sha256"],
+                outputs["settlement"][0],
+                outputs["settlement"][1],
+                outputs["ridership"][0],
+                outputs["ridership"][1],
+                result["contracts"]["settlement"]["fingerprint"],
+                result["contracts"]["ridership"]["fingerprint"],
+                result["contracts"]["settlement"]["version"],
+                result["contracts"]["ridership"]["version"],
+                settlement_cols,
+                ridership_cols,
+                parsed.row_count,
+                created_at,
+            ),
+        )
+        if current_rev == 0:
+            conn.execute(
+                "INSERT INTO days (day, current_rev, updated_at) VALUES (?, ?, ?)",
+                (day, new_rev, created_at),
+            )
+        else:
+            conn.execute(
+                "UPDATE days SET current_rev = ?, updated_at = ? WHERE day = ?",
+                (new_rev, created_at, day),
+            )
+        conn.execute(
+            "UPDATE previews SET consumed_at = ? WHERE id = ?",
+            (created_at, preview_id),
+        )
+        # The preview row is now consumed; publications are the only
+        # thing downloads resolve against, so the preview can go.
+        db.delete_preview(conn, preview_id)
+        row = db.get_publication(conn, day, new_rev)
+        return row
 
     # ------------------------------------------------------------------
     # reads

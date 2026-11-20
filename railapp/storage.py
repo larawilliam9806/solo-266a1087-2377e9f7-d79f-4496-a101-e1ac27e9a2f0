@@ -19,6 +19,11 @@ import tempfile
 from .errors import Unavailable
 
 _READ_CHUNK = 1024 * 1024
+_HEX = frozenset("0123456789abcdef")
+
+
+def _is_hex(name):
+    return bool(name) and all(ch in _HEX for ch in name)
 
 
 def _fsync_dir(path):
@@ -136,6 +141,61 @@ class BlobStore:
             return hasher.hexdigest() == digest
         except FileNotFoundError:
             return False
+
+    # -- cleanup support ---------------------------------------------------
+    def iter_blobs(self):
+        """List every well-formed blob on disk as {digest, size, path} dicts.
+
+        Entries that do not look like content-addressed blobs (wrong name
+        shape, non-hex characters, nested junk) are ignored, so the cleaner
+        never deletes anything it cannot recognise as one of its own blobs.
+        """
+        found = []
+        if not os.path.isdir(self.objects):
+            return found
+        for shard in os.scandir(self.objects):
+            if not shard.is_dir() or len(shard.name) != 2 or not _is_hex(shard.name):
+                continue
+            for entry in os.scandir(shard.path):
+                if (
+                    not entry.is_file()
+                    or len(entry.name) != 62
+                    or not _is_hex(entry.name)
+                ):
+                    continue
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    # Vanished or unreadable between scandir and stat; the
+                    # next round will see it again if it still exists.
+                    continue
+                found.append(
+                    {
+                        "digest": shard.name + entry.name,
+                        "size": size,
+                        "path": entry.path,
+                    }
+                )
+        return found
+
+    def delete(self, digest):
+        """Delete one blob.  Returns the bytes freed, or None if already gone.
+
+        Other OSErrors (permissions, I/O faults) propagate so the caller can
+        record the failure and retry on a later round.
+        """
+        path = self.path_for(digest)
+        try:
+            size = os.path.getsize(path)
+            os.unlink(path)
+        except FileNotFoundError:
+            return None
+        # Best effort: drop the shard directory if it is now empty.
+        try:
+            os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
+        return size
 
     # -- housekeeping ----------------------------------------------------
     def clean_tmp(self):

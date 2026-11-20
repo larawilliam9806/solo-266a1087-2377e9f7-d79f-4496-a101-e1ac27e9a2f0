@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}存储清理 · 日结发布台{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>存储清理</h1>
+  <p class="muted">
+    被放弃的预览和中断的发布会在磁盘上留下没有引用的 CSV 文件。清理会回收这些文件；
+    <strong>任一正式修订</strong>、<strong>未过期且未放弃的预览</strong>、以及
+    <strong>正在上传预览或确认发布中的文件</strong>（即使尚未登记）都会被保留。
+    清理期间上传预览与确认发布照常进行，无需等待整轮清理结束。
+  </p>
+  {% if notice %}<div class="alert warn">{{ notice }}</div>{% endif %}
+  {% if just_ran %}<div class="alert ok">清理已完成，结果如下。</div>{% endif %}
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="summary-label">磁盘上的文件对象</div>
+      <div class="summary-value">{{ summary.objects }} 个</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">总占用空间</div>
+      <div class="summary-value">{{ summary.bytes|filesize }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">仍被引用的文件</div>
+      <div class="summary-value">{{ summary.referenced }} 个</div>
+    </div>
+    <div class="summary-card {% if summary.unreferenced %}bad{% else %}ok{% endif %}">
+      <div class="summary-label">可回收（无引用）</div>
+      <div class="summary-value">{{ summary.unreferenced }} 个 / {{ summary.unreferenced_bytes|filesize }}</div>
+    </div>
+  </div>
+  <form method="post" action="{{ url_for('cleanup_run') }}" class="form-actions">
+    <button type="submit" class="button primary" {% if running %}disabled{% endif %}>立即清理</button>
+    <span class="status">只删除无引用文件；删除失败的文件会列在下方，可再次运行清理重试。</span>
+  </form>
+</section>
+
+{% if report %}
+<section class="panel">
+  <h2>最近一次清理结果</h2>
+  <div class="summary-grid">
+    <div class="summary-card ok">
+      <div class="summary-label">实际删除文件数</div>
+      <div class="summary-value">{{ report.deleted }} 个</div>
+    </div>
+    <div class="summary-card ok">
+      <div class="summary-label">释放空间</div>
+      <div class="summary-value">{{ report.freed_bytes|filesize }}</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">扫描 / 保留 / 跳过</div>
+      <div class="summary-value">{{ report.scanned }} / {{ report.kept }} / {{ report.skipped }}</div>
+    </div>
+    <div class="summary-card {% if report.failed %}bad{% else %}ok{% endif %}">
+      <div class="summary-label">删除失败</div>
+      <div class="summary-value">{{ report.failed|length }} 个</div>
+    </div>
+  </div>
+  <p class="muted">
+    开始于 {{ report.started_at }} · 完成于 {{ report.finished_at }}。
+    「跳过」是扫描之后才被预览或正式修订引用的文件，按规则保留。
+  </p>
+  {% if report.failed %}
+  <div class="alert danger">
+    <strong>{{ report.failed|length }} 个文件删除失败。</strong>它们仍在磁盘上，再次运行清理即可重试。
+  </div>
+  <div class="table-scroll">
+    <table class="grid">
+      <thead><tr><th>文件标识（SHA-256）</th><th>大小</th><th>失败原因</th></tr></thead>
+      <tbody>
+      {% for item in report.failed %}
+        <tr>
+          <td><code>{{ item.digest }}</code></td>
+          <td>{{ item.size|filesize }}</td>
+          <td>{{ item.error }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

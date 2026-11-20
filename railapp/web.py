@@ -15,9 +15,21 @@ from flask import (
 )
 
 from . import convert, db, domain
-from .errors import AppError, NotFound, Unprocessable
+from .cleanup import BlobCleaner, InFlightRegistry
+from .errors import AppError, Conflict, NotFound, Unprocessable
 from .publisher import Service
 from .storage import BlobStore, verify_publications
+
+
+def _format_bytes(num):
+    value = float(num)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
 
 
 def create_app(config=None):
@@ -62,8 +74,11 @@ def create_app(config=None):
     def get_conn():
         return db.connect(db_path)
 
-    service = Service(get_conn, store)
+    registry = InFlightRegistry()
+    service = Service(get_conn, store, registry=registry)
+    cleaner = BlobCleaner(get_conn, store, registry)
     app.extensions["service"] = service
+    app.extensions["cleaner"] = cleaner
     app.extensions["get_conn"] = get_conn
 
     # ------------------------------------------------------------------
@@ -136,6 +151,7 @@ def create_app(config=None):
     app.jinja_env.globals["downstreams"] = domain.DOWNSTREAMS
     app.jinja_env.globals["downstream_order"] = domain.DOWNSTREAM_ORDER
     app.jinja_env.globals["max_file_bytes"] = convert.MAX_FILE_BYTES
+    app.jinja_env.filters["filesize"] = _format_bytes
 
     # ------------------------------------------------------------------
     # HTML pages
@@ -225,6 +241,28 @@ def create_app(config=None):
             abort(404)
         return render_template("day.html", detail=detail)
 
+    @app.get("/cleanup")
+    def cleanup_page():
+        notice = None
+        if request.args.get("busy"):
+            notice = "上一轮清理仍在进行中，请稍后刷新查看结果"
+        return render_template(
+            "cleanup.html",
+            summary=cleaner.summary(),
+            report=cleaner.last_report,
+            running=cleaner.running,
+            just_ran=bool(request.args.get("ran")),
+            notice=notice,
+        )
+
+    @app.post("/cleanup/run")
+    def cleanup_run():
+        try:
+            cleaner.run()
+        except Conflict:
+            return redirect(url_for("cleanup_page", busy=1))
+        return redirect(url_for("cleanup_page", ran=1))
+
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
@@ -307,6 +345,23 @@ def create_app(config=None):
         # Damaged revisions do not make the service unhealthy (unaffected
         # revisions remain downloadable), but they are surfaced for operators.
         return jsonify({"status": "ok", "damaged_revisions": damaged})
+
+    @app.get("/api/cleanup")
+    def api_cleanup_status():
+        return jsonify(
+            {
+                "running": cleaner.running,
+                "store": cleaner.summary(),
+                "last_report": cleaner.last_report,
+            }
+        )
+
+    @app.post("/api/cleanup")
+    def api_cleanup_run():
+        # Synchronous but non-blocking for everyone else: the round holds no
+        # database write lock and its per-file critical section is one unlink,
+        # so previews and confirms proceed while it runs.
+        return jsonify(cleaner.run())
 
     # ------------------------------------------------------------------
     # downloads

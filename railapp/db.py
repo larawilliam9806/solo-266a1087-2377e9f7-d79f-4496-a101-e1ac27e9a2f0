@@ -236,6 +236,41 @@ def purge_expired_previews(conn, now=None):
     return ids
 
 
+def reference_digests(conn, now=None):
+    """All blob digests currently protected from cleanup.
+
+    A digest is protected when any publication row references it, or when a
+    preview that has neither expired nor been discarded references it — its
+    original upload plus any downstream outputs recorded in its result.
+    Callers that need a fresh answer must use a connection in autocommit
+    mode (like ``connect`` returns) so each call sees the latest commits.
+    """
+    now = now or utcnow()
+    digests = set()
+    for row in conn.execute(
+        "SELECT original_sha256, settlement_sha256, ridership_sha256 FROM publications"
+    ):
+        digests.add(row["original_sha256"])
+        digests.add(row["settlement_sha256"])
+        digests.add(row["ridership_sha256"])
+    for row in conn.execute(
+        "SELECT original_sha256, result_json FROM previews WHERE expires_at >= ?",
+        (iso(now),),
+    ):
+        digests.add(row["original_sha256"])
+        try:
+            result = json.loads(row["result_json"])
+        except (ValueError, TypeError):
+            continue
+        downstreams = result.get("downstreams") or {}
+        for name in domain.DOWNSTREAM_ORDER:
+            outcome = downstreams.get(name) or {}
+            digest = outcome.get("output_sha256")
+            if digest:
+                digests.add(digest)
+    return digests
+
+
 def wait_for_write_lock(conn, attempts=200, delay=0.05):
     """Best-effort helper used by tests to serialise around a busy database."""
     for _ in range(attempts):
